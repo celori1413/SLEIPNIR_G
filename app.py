@@ -1,4 +1,4 @@
-import json
+import re
 import gspread
 import pandas as pd
 import requests
@@ -27,6 +27,26 @@ HEADERS = {
         "Chrome/114.0.0.0 Safari/537.36"
     )
 }
+
+def clean_private_key(raw_key):
+    """
+    Secretsから受け取った秘密鍵の不要な空白、制御文字、ヘッダー/フッター崩れを完全補正する関数
+    """
+    key_str = str(raw_key)
+    # \n という2文字の文字列があれば実際の改行コードに置換
+    key_str = key_str.replace("\\n", "\n")
+    
+    # ヘッダーとフッターを除いた本体部分の英数字・記号のみを取り出す
+    body = key_str.replace("-----BEGIN PRIVATE KEY-----", "").replace("-----END PRIVATE KEY-----", "")
+    # 余計な空白・改行・制御文字を除去
+    body = re.sub(r'[\s\r\n\t]+', '', body)
+    
+    # 64文字ごとに改行を入れてPEMフォーマットを正規化
+    formatted_body = "\n".join([body[i:i+64] for i in range(0, len(body), 64)])
+    
+    # 正しいPEMフォーマットを再構築
+    clean_key = f"-----BEGIN PRIVATE KEY-----\n{formatted_body}\n-----END PRIVATE KEY-----\n"
+    return clean_key
 
 def fetch_race_results(url):
     res = requests.get(url, headers=HEADERS)
@@ -85,15 +105,11 @@ def append_to_sheet(df):
         "https://www.googleapis.com/auth/drive"
     ]
     
-    # Secrets から JSON を安全にパース
+    # Secrets から認証情報を取得
     if "gcp_service_account" in st.secrets:
-        sec = st.secrets["gcp_service_account"]
-        if "json_data" in sec:
-            key_dict = json.loads(sec["json_data"])
-        else:
-            key_dict = dict(sec)
-            if "private_key" in key_dict:
-                key_dict["private_key"] = key_dict["private_key"].replace("\\n", "\n")
+        key_dict = dict(st.secrets["gcp_service_account"])
+        if "private_key" in key_dict:
+            key_dict["private_key"] = clean_private_key(key_dict["private_key"])
             
         creds = Credentials.from_service_account_info(key_dict, scopes=scopes)
     else:
