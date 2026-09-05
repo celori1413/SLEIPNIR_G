@@ -18,7 +18,7 @@ race_url = st.text_input(
 )
 
 SPREADSHEET_KEY = "13YkfSZvwRV-sfX6F_rv6mVrEvZku0GZ4jJltbtIgYIE"
-TARGET_GID = "675289019"
+TARGET_GID = 675289019  # 数値型・文字列型の両方に対応
 
 HEADERS = {
     "User-Agent": (
@@ -85,19 +85,11 @@ def append_to_sheet(df):
         "https://www.googleapis.com/auth/drive"
     ]
     
-    # Secrets の扱いを堅牢化
+    # 認証情報の取得
     if "gcp_service_account" in st.secrets:
-        secret_val = st.secrets["gcp_service_account"]
-        
-        # 辞書型または文字列型に応じてパース
-        if isinstance(secret_val, str):
-            key_dict = json.loads(secret_val)
-        else:
-            key_dict = dict(secret_val)
-            
-        if "private_key" in key_dict and isinstance(key_dict["private_key"], str):
+        key_dict = dict(st.secrets["gcp_service_account"])
+        if "private_key" in key_dict:
             key_dict["private_key"] = key_dict["private_key"].replace("\\n", "\n")
-            
         creds = ServiceAccountCredentials.from_json_keyfile_dict(key_dict, scope)
     else:
         creds = ServiceAccountCredentials.from_json_keyfile_name("secret_key.json", scope)
@@ -105,29 +97,38 @@ def append_to_sheet(df):
     client = gspread.authorize(creds)
     spreadsheet = client.open_by_key(SPREADSHEET_KEY)
     
+    # シートの検索（ID比較の安全化）
     target_ws = None
     for ws in spreadsheet.worksheets():
         if str(ws.id) == str(TARGET_GID):
             target_ws = ws
             break
             
+    # 見つからない場合は1枚目のワークシートをフォールバックとして使用
     if not target_ws:
-        st.error(f"指定のシート (GID: {TARGET_GID}) が見つかりませんでした。")
-        return
+        target_ws = spreadsheet.sheet1
+        st.warning(f"指定のGID ({TARGET_GID}) が見つからなかったため、最初のシート '{target_ws.title}' に書き込みます。")
+
+    # NaN（空文字）の変換処理を行いデータ整形
+    df = df.fillna("")
+    rows_to_append = df.astype(str).values.tolist()
 
     existing = target_ws.get_all_values()
     if not existing:
         target_ws.append_row(df.columns.tolist())
         
-    target_ws.append_rows(df.values.tolist())
+    target_ws.append_rows(rows_to_append)
     st.success(f"✅ シート '{target_ws.title}' へ {len(df)} 件のデータを追記しました！")
 
 # --- 実行ボタン ---
 if st.button("スプレッドシートへ書き込む", type="primary"):
     with st.spinner("データを取得・送信中..."):
-        df_res = fetch_race_results(race_url)
-        if df_res is not None and not df_res.empty:
-            append_to_sheet(df_res)
-            st.dataframe(df_res)
-        else:
-            st.error("データの取得に失敗しました。URLを確認してください。")
+        try:
+            df_res = fetch_race_results(race_url)
+            if df_res is not None and not df_res.empty:
+                append_to_sheet(df_res)
+                st.dataframe(df_res)
+            else:
+                st.error("データの取得に失敗しました。URLを確認してください。")
+        except Exception as e:
+            st.error(f"エラーが発生しました: {e}")
