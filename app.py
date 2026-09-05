@@ -3,7 +3,7 @@ import gspread
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 import streamlit as st
 
 st.set_page_config(page_title="SLEIPNIR_DB02", layout="centered")
@@ -18,7 +18,7 @@ race_url = st.text_input(
 )
 
 SPREADSHEET_KEY = "13YkfSZvwRV-sfX6F_rv6mVrEvZku0GZ4jJltbtIgYIE"
-TARGET_GID = 675289019  # 数値型・文字列型の両方に対応
+TARGET_GID = 675289019
 
 HEADERS = {
     "User-Agent": (
@@ -80,36 +80,39 @@ def fetch_race_results(url):
     return pd.DataFrame(data)
 
 def append_to_sheet(df):
-    scope = [
-        "https://spreadsheets.google.com/feeds",
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
     ]
     
-    # 認証情報の取得
+    # Secrets から JSON を安全にパース
     if "gcp_service_account" in st.secrets:
-        key_dict = dict(st.secrets["gcp_service_account"])
-        if "private_key" in key_dict:
-            key_dict["private_key"] = key_dict["private_key"].replace("\\n", "\n")
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(key_dict, scope)
+        sec = st.secrets["gcp_service_account"]
+        if "json_data" in sec:
+            key_dict = json.loads(sec["json_data"])
+        else:
+            key_dict = dict(sec)
+            if "private_key" in key_dict:
+                key_dict["private_key"] = key_dict["private_key"].replace("\\n", "\n")
+            
+        creds = Credentials.from_service_account_info(key_dict, scopes=scopes)
     else:
-        creds = ServiceAccountCredentials.from_json_keyfile_name("secret_key.json", scope)
+        creds = Credentials.from_service_account_file("secret_key.json", scopes=scopes)
         
     client = gspread.authorize(creds)
     spreadsheet = client.open_by_key(SPREADSHEET_KEY)
     
-    # シートの検索（ID比較の安全化）
+    # GID によるワークシート検索
     target_ws = None
     for ws in spreadsheet.worksheets():
         if str(ws.id) == str(TARGET_GID):
             target_ws = ws
             break
             
-    # 見つからない場合は1枚目のワークシートをフォールバックとして使用
     if not target_ws:
         target_ws = spreadsheet.sheet1
         st.warning(f"指定のGID ({TARGET_GID}) が見つからなかったため、最初のシート '{target_ws.title}' に書き込みます。")
 
-    # NaN（空文字）の変換処理を行いデータ整形
     df = df.fillna("")
     rows_to_append = df.astype(str).values.tolist()
 
