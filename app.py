@@ -12,8 +12,11 @@ st.set_page_config(page_title="SLEIPNIR_DB02", layout="wide")
 
 st.title("SLEIPNIR🏇DB02")
 
-# スプレッドシートの設定 (SLEIPNIR_G_DB_2026)
-SPREADSHEET_KEY = "1_N4GQm5DeWh6lQrRjsA3nDDX5RgSNYwDy83cZiuCJ2c"
+# ================= ================= =================
+#  スプレッドシート設定（用途別にID分離）
+# ================= ================= =================
+RACE_SPREADSHEET_KEY = "1_N4GQm5DeWh6lQrRjsA3nDDX5RgSNYwDy83cZiuCJ2c"  # レース結果用 (SLEIPNIR_G_2026RaceDB)
+HORSE_SPREADSHEET_KEY = "1sGPn1S8Uz98YvQjYHaAWpDU-u7kzGoMtig31RFKHK8Q" # 馬データ専用
 
 HEADERS = {
     "User-Agent": (
@@ -48,9 +51,6 @@ def get_gspread_client():
 #  共通: ログ記録機能
 # ================= ================= =================
 def append_execution_log(spreadsheet, tab_name, target_info, status, detail=""):
-    """
-    スプレッドシートの「ログ」シートに実行結果を追記する
-    """
     log_sheet_name = "ログ"
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
@@ -171,7 +171,7 @@ def fetch_horse_data(url):
                 val = td.get_text(" ", strip=True)
                 info_dict[key] = val
 
-    # --- 血統テーブル (安全抽出) ---
+    # --- 血統テーブル ---
     blood_table = soup.find("table", class_="blood_table")
     father, mother, mother_father = "-", "-", "-"
     if blood_table:
@@ -184,7 +184,7 @@ def fetch_horse_data(url):
         if len(horse_links) >= 3:
             mother_father = horse_links[2]
 
-    # --- 適正レビュー ---
+    # --- 適性レビュー ---
     review_dict = {}
     diag_table = soup.find("table", class_="db_dia_table")
     if diag_table:
@@ -214,39 +214,48 @@ def fetch_horse_data(url):
     ]
     df_basic = pd.DataFrame(basic_data)
 
-    # --- 競走成績テーブル (見つからない場合のフォールバック対応) ---
+    # --- 競走成績テーブル ---
     results_data = []
-    race_table = soup.find("table", class_="db_h_race_results") or soup.find("table", class_="NK_HorseRaceResults")
+    race_table = (
+        soup.find("table", class_="db_h_race_results") or 
+        soup.find("table", class_="tbl_had") or 
+        soup.find("table", class_="NK_HorseRaceResults") or
+        soup.find("table", summary="競走成績")
+    )
+
     if race_table:
-        rows = race_table.find("tbody").find_all("tr") if race_table.find("tbody") else race_table.find_all("tr")
+        rows = race_table.find_all("tr")
         for row in rows:
             cols = row.find_all("td")
-            if len(cols) < 20:
+            if len(cols) < 15:
                 continue
             
+            def get_col_val(idx):
+                return cols[idx].get_text(strip=True) if len(cols) > idx else "-"
+
             results_data.append({
-                "日付": cols[0].get_text(strip=True),
-                "開催": cols[1].get_text(strip=True),
-                "天気": cols[2].get_text(strip=True),
-                "R": cols[3].get_text(strip=True),
-                "レース名": cols[4].get_text(strip=True),
-                "頭数": cols[6].get_text(strip=True),
-                "枠番": cols[7].get_text(strip=True),
-                "馬番": cols[8].get_text(strip=True),
-                "オッズ": cols[9].get_text(strip=True),
-                "人気": cols[10].get_text(strip=True),
-                "着順": cols[11].get_text(strip=True),
-                "騎手": cols[12].get_text(strip=True),
-                "斤量": cols[13].get_text(strip=True),
-                "距離": cols[14].get_text(strip=True),
-                "馬場": cols[15].get_text(strip=True),
-                "タイム": cols[17].get_text(strip=True),
-                "着差": cols[18].get_text(strip=True),
-                "通過": cols[20].get_text(strip=True),
-                "ペース": cols[21].get_text(strip=True),
-                "上がり": cols[22].get_text(strip=True),
-                "体重": cols[23].get_text(strip=True),
-                "勝ち馬(2着馬)": cols[26].get_text(strip=True) if len(cols) > 26 else "-"
+                "日付": get_col_val(0),
+                "開催": get_col_val(1),
+                "天気": get_col_val(2),
+                "R": get_col_val(3),
+                "レース名": get_col_val(4),
+                "頭数": get_col_val(6),
+                "枠番": get_col_val(7),
+                "馬番": get_col_val(8),
+                "オッズ": get_col_val(9),
+                "人気": get_col_val(10),
+                "着順": get_col_val(11),
+                "騎手": get_col_val(12),
+                "斤量": get_col_val(13),
+                "距離": get_col_val(14),
+                "馬場": get_col_val(15),
+                "タイム": get_col_val(17),
+                "着差": get_col_val(18),
+                "通過": get_col_val(20),
+                "ペース": get_col_val(21),
+                "上がり": get_col_val(22),
+                "体重": get_col_val(23),
+                "勝ち馬(2着馬)": get_col_val(26)
             })
 
     df_results = pd.DataFrame(results_data)
@@ -255,9 +264,6 @@ def fetch_horse_data(url):
 
 
 def update_horse_sheet(spreadsheet, sheet_name, df_basic, df_results):
-    """
-    同一シートへ基本情報と競走成績を安全に書き込み・差分更新する。
-    """
     try:
         ws = spreadsheet.worksheet(sheet_name)
         existing_values = ws.get_all_values()
@@ -265,7 +271,6 @@ def update_horse_sheet(spreadsheet, sheet_name, df_basic, df_results):
         ws = spreadsheet.add_worksheet(title=sheet_name, rows=200, cols=30)
         existing_values = []
 
-    # 既存データのユニークキー（日付＋レース名）を取得
     existing_keys = set()
     for row in existing_values:
         if len(row) >= 5 and row[0] not in ["日付", "【基本情報】", "【競走成績】", ""]:
@@ -278,13 +283,12 @@ def update_horse_sheet(spreadsheet, sheet_name, df_basic, df_results):
             if key not in existing_keys:
                 new_races_count += 1
 
-    # 書き込みデータ構築
     all_rows = []
     all_rows.append(["【基本情報】", ""])
     for idx, row in df_basic.iterrows():
         all_rows.append([str(row["項目"]), str(row["内容"])])
     
-    all_rows.append([]) # 空行
+    all_rows.append([])
     all_rows.append(["【競走成績】"])
     
     if not df_results.empty:
@@ -294,7 +298,6 @@ def update_horse_sheet(spreadsheet, sheet_name, df_basic, df_results):
     else:
         all_rows.append(["（※競走成績データなし・未出走馬）"])
 
-    # シート上書き更新
     ws.clear()
     ws.update(values=all_rows)
 
@@ -338,7 +341,8 @@ tab1, tab2, tab3 = st.tabs(["🏁 レース結果取得", "🐎 単体馬デー�
 # --- TAB 1: レース結果 ---
 with tab1:
     st.header("レース結果の取得")
-    st.write("netkeibaのレース結果URLから、全着順データを抽出してスプレッドシートへ書き込みます。")
+    st.caption("保存先: SLEIPNIR_G_2026RaceDB")
+    st.write("netkeibaのレース結果URLから、全着順データを抽出してレース用スプレッドシートへ書き込みます。")
     race_url = st.text_input("レース結果のURL", value="", key="race_url_input")
 
     if st.button("レース結果を書き込む", type="primary", key="btn_race"):
@@ -350,10 +354,9 @@ with tab1:
                     df_res, sheet_name = fetch_race_results(race_url)
                     if df_res is not None and not df_res.empty:
                         client = get_gspread_client()
-                        spreadsheet = client.open_by_key(SPREADSHEET_KEY)
+                        spreadsheet = client.open_by_key(RACE_SPREADSHEET_KEY)
                         written_title = write_race_to_sheet(spreadsheet, sheet_name, df_res)
                         
-                        # ログ保存
                         append_execution_log(spreadsheet, "レース結果取得", race_url, "SUCCESS", f"シート '{written_title}' ({len(df_res)}件)")
                         
                         st.success(f"✅ シート '{written_title}' へデータを出力しました！")
@@ -363,13 +366,13 @@ with tab1:
                     else:
                         st.error("データの取得に失敗しました。URLを確認してください。")
                         client = get_gspread_client()
-                        spreadsheet = client.open_by_key(SPREADSHEET_KEY)
+                        spreadsheet = client.open_by_key(RACE_SPREADSHEET_KEY)
                         append_execution_log(spreadsheet, "レース結果取得", race_url, "FAILED", "テーブルが検出できませんでした")
                 except Exception as e:
                     st.error(f"エラーが発生しました: {e}")
                     try:
                         client = get_gspread_client()
-                        spreadsheet = client.open_by_key(SPREADSHEET_KEY)
+                        spreadsheet = client.open_by_key(RACE_SPREADSHEET_KEY)
                         append_execution_log(spreadsheet, "レース結果取得", race_url, "ERROR", str(e))
                     except:
                         pass
@@ -377,6 +380,7 @@ with tab1:
 # --- TAB 2: 単体馬データ ---
 with tab2:
     st.header("馬データの取得 (単体)")
+    st.caption("保存先: 馬データ専用スプレッドシート")
     st.write("同一シート内に基本情報と全競走成績を書き込みます。既に存在する馬の場合は自動で最新データに更新されます。")
     horse_url = st.text_input("馬ページのURL (例: https://db.netkeiba.com/horse/2021103272)", value="", key="horse_url_input")
 
@@ -389,11 +393,10 @@ with tab2:
                     df_basic, df_results, horse_name = fetch_horse_data(horse_url)
                     if df_basic is not None and not df_basic.empty:
                         client = get_gspread_client()
-                        spreadsheet = client.open_by_key(SPREADSHEET_KEY)
+                        spreadsheet = client.open_by_key(HORSE_SPREADSHEET_KEY)
                         
                         msg = update_horse_sheet(spreadsheet, horse_name, df_basic, df_results)
                         
-                        # ログ保存
                         append_execution_log(spreadsheet, "単体馬データ取得", horse_name, "SUCCESS", f"{msg} (成績:{len(df_results)}件)")
                         
                         st.success(f"✅ シート '{horse_name}' : {msg}")
@@ -409,13 +412,13 @@ with tab2:
                     else:
                         st.error("馬データの取得に失敗しました。URLを確認してください。")
                         client = get_gspread_client()
-                        spreadsheet = client.open_by_key(SPREADSHEET_KEY)
+                        spreadsheet = client.open_by_key(HORSE_SPREADSHEET_KEY)
                         append_execution_log(spreadsheet, "単体馬データ取得", horse_url, "FAILED", "データ解析に失敗")
                 except Exception as e:
                     st.error(f"エラーが発生しました: {e}")
                     try:
                         client = get_gspread_client()
-                        spreadsheet = client.open_by_key(SPREADSHEET_KEY)
+                        spreadsheet = client.open_by_key(HORSE_SPREADSHEET_KEY)
                         append_execution_log(spreadsheet, "単体馬データ取得", horse_url, "ERROR", str(e))
                     except:
                         pass
@@ -423,6 +426,7 @@ with tab2:
 # --- TAB 3: 出走表から全馬取得 ---
 with tab3:
     st.header("出走表からの全馬一括取得")
+    st.caption("保存先: 馬データ専用スプレッドシート")
     st.write("出走表（枠順表）のURLを入力すると、出走する全馬のデータを取得して一括でスプレッドシートへ書き込み・更新します。")
     shutuba_url = st.text_input("出走表のURL (例: https://race.netkeiba.com/race/shutuba.html?race_id=...)", value="", key="shutuba_url_input")
 
@@ -439,7 +443,7 @@ with tab3:
                 st.info(f"🐎 計 {len(horse_urls)} 頭の出走馬を検出しました。データの取得・書き込みを開始します...")
                 
                 client = get_gspread_client()
-                spreadsheet = client.open_by_key(SPREADSHEET_KEY)
+                spreadsheet = client.open_by_key(HORSE_SPREADSHEET_KEY)
 
                 progress_bar = st.progress(0)
                 status_text = st.empty()
@@ -456,7 +460,6 @@ with tab3:
                             status_text.text(res_msg)
                             log_details.append(res_msg)
                             
-                            # 1頭ごとのログ記録
                             append_execution_log(spreadsheet, "出走表全馬取得", horse_name, "SUCCESS", msg)
                             success_count += 1
                         else:
@@ -470,9 +473,8 @@ with tab3:
                         log_details.append(res_msg)
                         append_execution_log(spreadsheet, "出走表全馬取得", h_url, "ERROR", str(e))
 
-                    # 進捗更新
                     progress_bar.progress((idx + 1) / len(horse_urls))
-                    time.sleep(1) # IPブロック防止用ウエイト
+                    time.sleep(1)
 
                 st.success(f"🎉 一括処理が完了しました！ ({success_count}/{len(horse_urls)} 頭成功)")
                 
