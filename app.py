@@ -147,7 +147,7 @@ def write_race_to_sheet(spreadsheet, sheet_name, df):
     return target_ws.title
 
 # ================= ================= =================
-#  2. 馬データ スクレイピング（改修版）
+#  2. 馬データ スクレイピング（高精度・完全版）
 # ================= ================= =================
 def fetch_horse_data(url):
     res = requests.get(url, headers=HEADERS)
@@ -163,9 +163,9 @@ def fetch_horse_data(url):
         horse_name = h1.get_text(strip=True) if h1 else "競走馬"
     horse_name = re.sub(r'[\r\n\t]', '', horse_name)
 
-    # --- 基本情報テーブル ---
-    info_table = soup.find("table", class_="db_prof_table")
+    # --- 基本情報テーブル解析 ---
     info_dict = {}
+    info_table = soup.find("table", class_="db_prof_table")
     if info_table:
         for tr in info_table.find_all("tr"):
             th = tr.find("th")
@@ -175,37 +175,59 @@ def fetch_horse_data(url):
                 val = td.get_text(" ", strip=True)
                 info_dict[key] = val
 
-    # --- 血統情報（修正・強化）---
-    blood_table = soup.find("table", class_="blood_table")
+    # --- 血統情報（詳細抽出ロジック）---
     father, mother, mother_father = "-", "-", "-"
+    blood_table = soup.find("table", class_="blood_table")
     if blood_table:
-        a_tags = blood_table.find_all("a")
-        horse_links = []
-        for a in a_tags:
-            href = a.get("href", "")
-            txt = a.get_text(strip=True)
-            if "/horse/" in href and txt and txt not in horse_links:
-                horse_links.append(txt)
+        tds = blood_table.find_all("td")
+        p_links = []
+        for td in tds:
+            a_tag = td.find("a")
+            if a_tag and "/horse/" in a_tag.get("href", ""):
+                txt = a_tag.get_text(strip=True)
+                if txt and txt not in p_links:
+                    p_links.append(txt)
         
-        if len(horse_links) >= 1:
-            father = horse_links[0]
-        if len(horse_links) >= 2:
-            mother = horse_links[1]
-        if len(horse_links) >= 3:
-            mother_father = horse_links[2]
+        if len(p_links) >= 1:
+            father = p_links[0]
+        if len(p_links) >= 2:
+            mother = p_links[1]
+        if len(p_links) >= 3:
+            mother_father = p_links[2]
 
-    # --- コース適性・距離適性（修正・強化）---
-    review_dict = {}
-    diag_table = soup.find("table", class_="db_dia_table") or soup.find("table", class_="dial_table")
+    # --- コース適性・距離適性（網羅的抽出ロジック）---
+    turf_dirt = "-"
+    dist_apt = "-"
+
+    # パターンA: db_dia_table / dial_table
+    diag_table = soup.find("table", class_="db_dia_table") or soup.find("table", class_="dial_table") or soup.find("div", class_="db_prof_box_02")
     if diag_table:
-        for tr in diag_table.find_all("tr"):
-            th = tr.find("th")
-            td = tr.find("td")
-            if th and td:
-                review_dict[th.get_text(strip=True)] = td.get_text(strip=True)
+        text_content = diag_table.get_text()
+        # 芝・ダート適性
+        if "芝" in text_content and "ダート" in text_content:
+            m_td = re.search(r'(芝[^\n\r]*|ダート[^\n\r]*)', text_content)
+            if m_td:
+                turf_dirt = m_td.group(0).strip()
+            else:
+                turf_dirt = "芝・ダート適性情報あり"
+        elif "芝" in text_content:
+            turf_dirt = "芝適性重視"
+        elif "ダート" in text_content:
+            turf_dirt = "ダート適性重視"
 
-    turf_dirt = review_dict.get("芝", review_dict.get("コース適性", review_dict.get("馬場", "-")))
-    dist_apt = review_dict.get("距離", review_dict.get("距離適性", "-"))
+        # 距離適性
+        m_dist = re.search(r'(\d{4}m\s*～\s*\d{4}m|\d{4}m[^\n\r]*)', text_content)
+        if m_dist:
+            dist_apt = m_dist.group(0).strip()
+
+    # パターンB: 代替テキスト抽出（「適性」表記が含まれるエレメントを探す）
+    if turf_dirt == "-" or dist_apt == "-":
+        for elem in soup.find_all(["div", "td", "p"], class_=re.compile(r'prof|dia|apt|style')):
+            txt = elem.get_text(strip=True)
+            if turf_dirt == "-" and ("万能" in txt or "芝" in txt or "ダ" in txt):
+                turf_dirt = txt[:30]
+            if dist_apt == "-" and ("m" in txt and ("短距離" in txt or "マイル" in txt or "中距離" in txt or "長距離" in txt or "～" in txt)):
+                dist_apt = txt[:30]
 
     # 基本データ構築（賞金データは完全削除）
     basic_data = [
@@ -226,62 +248,52 @@ def fetch_horse_data(url):
     ]
     df_basic = pd.DataFrame(basic_data)
 
-    # --- 競走成績テーブル（構造変更に対応する堅牢化処理）---
+    # --- 競走成績テーブル（db_h_race_results 完全解析）---
     results_data = []
-    race_table = None
+    race_table = soup.find("table", class_="db_h_race_results")
     
-    # 候補1: 標準的なクラス名
-    race_table = (
-        soup.find("table", class_="db_h_race_results") or 
-        soup.find("table", class_="tbl_had") or 
-        soup.find("table", class_="NK_HorseRaceResults") or
-        soup.find("table", summary="競走成績")
-    )
-    
-    # 候補2: クラス名で見つからない場合は全テーブルから競走成績テーブルを検出
     if not race_table:
-        all_tables = soup.find_all("table")
-        for tbl in all_tables:
-            txt = tbl.get_text()
-            if "日付" in txt and ("レース名" in txt or "映像" in txt or "頭数" in txt):
+        # 代替テーブル走査
+        for tbl in soup.find_all("table"):
+            if "日付" in tbl.get_text() and "レース名" in tbl.get_text():
                 race_table = tbl
                 break
 
     if race_table:
         rows = race_table.find_all("tr")
         for row in rows:
-            cols = row.find_all(["td", "th"])
-            # ヘッダー行やデータが少ない行をスキップ
-            if len(cols) < 10 or "日付" in cols[0].get_text():
+            cols = row.find_all("td")
+            if not cols:
                 continue
-            
-            def get_val(idx):
-                return cols[idx].get_text(strip=True) if len(cols) > idx else "-"
-
-            results_data.append({
-                "日付": get_val(0),
-                "開催": get_val(1),
-                "天気": get_val(2),
-                "R": get_val(3),
-                "レース名": get_val(4),
-                "頭数": get_val(6),
-                "枠番": get_val(7),
-                "馬番": get_val(8),
-                "オッズ": get_val(9),
-                "人気": get_val(10),
-                "着順": get_val(11),
-                "騎手": get_val(12),
-                "斤量": get_val(13),
-                "距離": get_val(14),
-                "馬場": get_val(15),
-                "タイム": get_val(17),
-                "着差": get_val(18),
-                "通過": get_val(20),
-                "ペース": get_val(21),
-                "上がり": get_val(22),
-                "体重": get_val(23),
-                "勝ち馬(2着馬)": get_val(26) if len(cols) > 26 else get_val(-1)
-            })
+                
+            col_texts = [c.get_text(strip=True) for c in cols]
+            if len(col_texts) >= 15:
+                # 標準28列に合わせた厳密マッピング
+                row_dict = {
+                    "日付": col_texts[0] if len(col_texts) > 0 else "-",
+                    "開催": col_texts[1] if len(col_texts) > 1 else "-",
+                    "天気": col_texts[2] if len(col_texts) > 2 else "-",
+                    "R": col_texts[3] if len(col_texts) > 3 else "-",
+                    "レース名": col_texts[4] if len(col_texts) > 4 else "-",
+                    "頭数": col_texts[6] if len(col_texts) > 6 else "-",
+                    "枠番": col_texts[7] if len(col_texts) > 7 else "-",
+                    "馬番": col_texts[8] if len(col_texts) > 8 else "-",
+                    "オッズ": col_texts[9] if len(col_texts) > 9 else "-",
+                    "人気": col_texts[10] if len(col_texts) > 10 else "-",
+                    "着順": col_texts[11] if len(col_texts) > 11 else "-",
+                    "騎手": col_texts[12] if len(col_texts) > 12 else "-",
+                    "斤量": col_texts[13] if len(col_texts) > 13 else "-",
+                    "距離": col_texts[14] if len(col_texts) > 14 else "-",
+                    "馬場": col_texts[15] if len(col_texts) > 15 else "-",
+                    "タイム": col_texts[17] if len(col_texts) > 17 else "-",
+                    "着差": col_texts[18] if len(col_texts) > 18 else "-",
+                    "通過": col_texts[20] if len(col_texts) > 20 else "-",
+                    "ペース": col_texts[21] if len(col_texts) > 21 else "-",
+                    "上がり": col_texts[22] if len(col_texts) > 22 else "-",
+                    "体重": col_texts[23] if len(col_texts) > 23 else "-",
+                    "勝ち馬(2着馬)": col_texts[26] if len(col_texts) > 26 else col_texts[-1]
+                }
+                results_data.append(row_dict)
 
     df_results = pd.DataFrame(results_data)
     clean_horse_name = re.sub(r'[/\\?*:[\]]', '', horse_name)[:30]
@@ -293,7 +305,7 @@ def update_horse_sheet(spreadsheet, sheet_name, df_basic, df_results):
         ws = spreadsheet.worksheet(sheet_name)
         existing_values = ws.get_all_values()
     except gspread.exceptions.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=sheet_name, rows=200, cols=30)
+        ws = spreadsheet.add_worksheet(title=sheet_name, rows=300, cols=30)
         existing_values = []
 
     existing_keys = set()
