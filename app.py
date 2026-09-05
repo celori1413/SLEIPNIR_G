@@ -17,8 +17,9 @@ race_url = st.text_input(
     value="https://race.netkeiba.com/race/result.html?race_id=202609030411&rf=race_submenu"
 )
 
-SPREADSHEET_KEY = "13YkfSZvwRV-sfX6F_rv6mVrEvZku0GZ4jJltbtIgYIE"
-TARGET_GID = 675289019
+# 新しいスプレッドシート（SLEIPNIR_G_DB_2026）の設定
+SPREADSHEET_KEY = "1_N4GQm5DeWh6lQrRjsA3nDDX5RgSNYwDy83cZiuCJ2c"
+TARGET_GID = 0
 
 HEADERS = {
     "User-Agent": (
