@@ -1,4 +1,5 @@
 import re
+import time
 import gspread
 import pandas as pd
 import requests
@@ -6,20 +7,12 @@ from bs4 import BeautifulSoup
 from google.oauth2.service_account import Credentials
 import streamlit as st
 
-st.set_page_config(page_title="SLEIPNIR_DB02", layout="centered")
+st.set_page_config(page_title="SLEIPNIR_DB02", layout="wide")
 
 st.title("SLEIPNIR🏇DB02")
-st.write("netkeibaのURLを入力すると、データを抽出してGoogleスプレッドシートへ書き込みます。")
 
-# --- 画面入力項目 ---
-race_url = st.text_input(
-    "レース結果のURL",
-    value="https://race.netkeiba.com/race/result.html?race_id=202609030411&rf=race_submenu"
-)
-
-# 新しいスプレッドシート（SLEIPNIR_G_DB_2026）の設定
+# スプレッドシートの設定 (SLEIPNIR_G_DB_2026)
 SPREADSHEET_KEY = "1_N4GQm5DeWh6lQrRjsA3nDDX5RgSNYwDy83cZiuCJ2c"
-TARGET_GID = 0
 
 HEADERS = {
     "User-Agent": (
@@ -30,25 +23,29 @@ HEADERS = {
 }
 
 def clean_private_key(raw_key):
-    """
-    Secretsから受け取った秘密鍵の不要な空白、制御文字、ヘッダー/フッター崩れを完全補正する関数
-    """
-    key_str = str(raw_key)
-    # \n という2文字の文字列があれば実際の改行コードに置換
-    key_str = key_str.replace("\\n", "\n")
-    
-    # ヘッダーとフッターを除いた本体部分の英数字・記号のみを取り出す
+    key_str = str(raw_key).replace("\\n", "\n")
     body = key_str.replace("-----BEGIN PRIVATE KEY-----", "").replace("-----END PRIVATE KEY-----", "")
-    # 余計な空白・改行・制御文字を除去
     body = re.sub(r'[\s\r\n\t]+', '', body)
-    
-    # 64文字ごとに改行を入れてPEMフォーマットを正規化
     formatted_body = "\n".join([body[i:i+64] for i in range(0, len(body), 64)])
-    
-    # 正しいPEMフォーマットを再構築
-    clean_key = f"-----BEGIN PRIVATE KEY-----\n{formatted_body}\n-----END PRIVATE KEY-----\n"
-    return clean_key
+    return f"-----BEGIN PRIVATE KEY-----\n{formatted_body}\n-----END PRIVATE KEY-----\n"
 
+def get_gspread_client():
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    if "gcp_service_account" in st.secrets:
+        key_dict = dict(st.secrets["gcp_service_account"])
+        if "private_key" in key_dict:
+            key_dict["private_key"] = clean_private_key(key_dict["private_key"])
+        creds = Credentials.from_service_account_info(key_dict, scopes=scopes)
+    else:
+        creds = Credentials.from_service_account_file("secret_key.json", scopes=scopes)
+    return gspread.authorize(creds)
+
+# ================= ================= =================
+#  1. レース結果 スクレイピング & 書き込み
+# ================= ================= =================
 def fetch_race_results(url):
     res = requests.get(url, headers=HEADERS)
     res.encoding = res.apparent_encoding
@@ -56,8 +53,24 @@ def fetch_race_results(url):
     
     table = soup.find("table", id="All_Result_Table") or soup.find("table", class_="RaceTable01")
     if not table:
-        return None
+        return None, None
         
+    year_match = re.search(r'race_id=(\d{4})', url)
+    year = year_match.group(1) if year_match else "2026"
+
+    race_title_elem = (
+        soup.find("div", class_="RaceName") or 
+        soup.find("h1", class_="RaceName") or 
+        soup.find("div", class_="race_name")
+    )
+    if race_title_elem:
+        race_name = re.sub(r'[\r\n\t]+', '', race_title_elem.get_text(strip=True))
+    else:
+        race_name = "レース結果"
+
+    full_sheet_name = f"{year}{race_name}"
+    full_sheet_name = re.sub(r'[/\\?*:[\]]', '', full_sheet_name)[:80]
+
     data = []
     rows = table.find_all("tr", class_="HorseList")
     
@@ -66,24 +79,23 @@ def fetch_race_results(url):
         if len(cols) < 11:
             continue
             
-        jockey_a = cols[6].find("a")
-        jockey = (
-            jockey_a.get("title").strip()
-            if (jockey_a and jockey_a.get("title"))
-            else cols[6].get_text(strip=True)
-        )
+        jockey_col = row.find("td", class_="Jockey") or (cols[6] if len(cols) > 6 else None)
+        jockey = "-"
+        if jockey_col:
+            jockey_a = jockey_col.find("a")
+            jockey = jockey_a.get("title").strip() if (jockey_a and jockey_a.get("title")) else jockey_col.get_text(strip=True)
         
-        stable_col = cols[13] if len(cols) > 13 else None
-        if stable_col:
-            stable_a = stable_col.find("a")
-            if stable_a and stable_a.get("title"):
-                trainer_name = stable_a.get("title").strip()
-                belonging = stable_col.get_text(strip=True).split("\n")[0]
-                stable = f"{belonging}{trainer_name}"
+        trainer_col = row.find("td", class_="Trainer") or (cols[13] if len(cols) > 13 else None)
+        stable = "-"
+        if trainer_col:
+            belonging_text = trainer_col.get_text(strip=True)
+            belonging = belonging_text[belonging_text.find("["):belonging_text.find("]")+1] if "[" in belonging_text and "]" in belonging_text else ""
+            trainer_a = trainer_col.find("a")
+            if trainer_a and trainer_a.get("title"):
+                trainer_name = trainer_a.get("title").strip()
+                stable = f"{belonging}{trainer_name}" if belonging else trainer_name
             else:
-                stable = stable_col.get_text(strip=True)
-        else:
-            stable = "-"
+                stable = belonging_text
 
         data.append({
             "着順": cols[0].get_text(strip=True),
@@ -98,57 +110,289 @@ def fetch_race_results(url):
             "コーナー通過順": cols[10].get_text(strip=True)
         })
         
-    return pd.DataFrame(data)
+    return pd.DataFrame(data), full_sheet_name
 
-def append_to_sheet(df):
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
-    
-    # Secrets から認証情報を取得
-    if "gcp_service_account" in st.secrets:
-        key_dict = dict(st.secrets["gcp_service_account"])
-        if "private_key" in key_dict:
-            key_dict["private_key"] = clean_private_key(key_dict["private_key"])
-            
-        creds = Credentials.from_service_account_info(key_dict, scopes=scopes)
-    else:
-        creds = Credentials.from_service_account_file("secret_key.json", scopes=scopes)
-        
-    client = gspread.authorize(creds)
-    spreadsheet = client.open_by_key(SPREADSHEET_KEY)
-    
-    # GID によるワークシート検索
-    target_ws = None
-    for ws in spreadsheet.worksheets():
-        if str(ws.id) == str(TARGET_GID):
-            target_ws = ws
-            break
-            
-    if not target_ws:
-        target_ws = spreadsheet.sheet1
-        st.warning(f"指定のGID ({TARGET_GID}) が見つからなかったため、最初のシート '{target_ws.title}' に書き込みます。")
+def write_race_to_sheet(spreadsheet, sheet_name, df):
+    try:
+        target_ws = spreadsheet.worksheet(sheet_name)
+        target_ws.clear()
+    except gspread.exceptions.WorksheetNotFound:
+        target_ws = spreadsheet.add_worksheet(title=sheet_name, rows=len(df)+10, cols=len(df.columns)+5)
 
     df = df.fillna("")
-    rows_to_append = df.astype(str).values.tolist()
+    rows_to_append = [df.columns.tolist()] + df.astype(str).values.tolist()
+    target_ws.update(values=rows_to_append)
+    return target_ws.title
 
-    existing = target_ws.get_all_values()
-    if not existing:
-        target_ws.append_row(df.columns.tolist())
-        
-    target_ws.append_rows(rows_to_append)
-    st.success(f"✅ シート '{target_ws.title}' へ {len(df)} 件のデータを追記しました！")
+# ================= ================= =================
+#  2. 馬データ（基本情報＋競走成績統合） スクレイピング
+# ================= ================= =================
+def fetch_horse_data(url):
+    res = requests.get(url, headers=HEADERS)
+    res.encoding = res.apparent_encoding
+    soup = BeautifulSoup(res.text, "html.parser")
 
-# --- 実行ボタン ---
-if st.button("スプレッドシートへ書き込む", type="primary"):
-    with st.spinner("データを取得・送信中..."):
-        try:
-            df_res = fetch_race_results(race_url)
-            if df_res is not None and not df_res.empty:
-                append_to_sheet(df_res)
-                st.dataframe(df_res)
+    # --- 馬名取得 ---
+    horse_title = soup.find("div", class_="horse_title")
+    horse_name = horse_title.find("h1").get_text(strip=True) if horse_title and horse_title.find("h1") else "競走馬"
+    horse_name = re.sub(r'[\r\n\t]', '', horse_name)
+
+    # --- 基本情報テーブル ---
+    info_table = soup.find("table", class_="db_prof_table")
+    info_dict = {}
+    if info_table:
+        for tr in info_table.find_all("tr"):
+            th = tr.find("th")
+            td = tr.find("td")
+            if th and td:
+                key = th.get_text(strip=True)
+                val = td.get_text(" ", strip=True)
+                info_dict[key] = val
+
+    # --- 血統テーブル (安全抽出) ---
+    blood_table = soup.find("table", class_="blood_table")
+    father, mother, mother_father = "-", "-", "-"
+    if blood_table:
+        a_tags = blood_table.find_all("a")
+        horse_links = [a.get_text(strip=True) for a in a_tags if "/horse/" in a.get("href", "")]
+        if len(horse_links) >= 1:
+            father = horse_links[0]
+        if len(horse_links) >= 2:
+            mother = horse_links[1]
+        if len(horse_links) >= 3:
+            mother_father = horse_links[2]
+
+    # --- 適正レビュー ---
+    review_dict = {}
+    diag_table = soup.find("table", class_="db_dia_table")
+    if diag_table:
+        for tr in diag_table.find_all("tr"):
+            th = tr.find("th")
+            td = tr.find("td")
+            if th and td:
+                review_dict[th.get_text(strip=True)] = td.get_text(strip=True)
+
+    basic_data = [
+        {"項目": "馬名", "内容": horse_name},
+        {"項目": "生年月日", "内容": info_dict.get("生年月日", "-")},
+        {"項目": "調教師", "内容": info_dict.get("調教師", "-")},
+        {"項目": "馬主", "内容": info_dict.get("馬主", "-")},
+        {"項目": "生産者", "内容": info_dict.get("生産者", "-")},
+        {"項目": "産地", "内容": info_dict.get("産地", "-")},
+        {"項目": "中央獲得賞金", "内容": info_dict.get("獲得賞金", "-")},
+        {"項目": "地方獲得賞金", "内容": info_dict.get("地方獲得賞金", "-")},
+        {"項目": "通算成績", "内容": info_dict.get("通算成績", "-")},
+        {"項目": "主な勝鞍", "内容": info_dict.get("主な勝鞍", "-")},
+        {"項目": "近親馬", "内容": info_dict.get("近親馬", "-")},
+        {"項目": "父", "内容": father},
+        {"項目": "母", "内容": mother},
+        {"項目": "母父", "内容": mother_father},
+        {"項目": "適性・芝ダート", "内容": review_dict.get("芝", review_dict.get("コース適性", "-"))},
+        {"項目": "距離適性", "内容": review_dict.get("距離", "-")}
+    ]
+    df_basic = pd.DataFrame(basic_data)
+
+    # --- 競走成績テーブル ---
+    results_data = []
+    race_table = soup.find("table", class_="db_h_race_results")
+    if race_table:
+        rows = race_table.find("tbody").find_all("tr") if race_table.find("tbody") else race_table.find_all("tr")
+        for row in rows:
+            cols = row.find_all("td")
+            if len(cols) < 20:
+                continue
+            
+            results_data.append({
+                "日付": cols[0].get_text(strip=True),
+                "開催": cols[1].get_text(strip=True),
+                "天気": cols[2].get_text(strip=True),
+                "R": cols[3].get_text(strip=True),
+                "レース名": cols[4].get_text(strip=True),
+                "頭数": cols[6].get_text(strip=True),
+                "枠番": cols[7].get_text(strip=True),
+                "馬番": cols[8].get_text(strip=True),
+                "オッズ": cols[9].get_text(strip=True),
+                "人気": cols[10].get_text(strip=True),
+                "着順": cols[11].get_text(strip=True),
+                "騎手": cols[12].get_text(strip=True),
+                "斤量": cols[13].get_text(strip=True),
+                "距離": cols[14].get_text(strip=True),
+                "馬場": cols[15].get_text(strip=True),
+                "タイム": cols[17].get_text(strip=True),
+                "着差": cols[18].get_text(strip=True),
+                "通過": cols[20].get_text(strip=True),
+                "ペース": cols[21].get_text(strip=True),
+                "上がり": cols[22].get_text(strip=True),
+                "体重": cols[23].get_text(strip=True),
+                "勝ち馬(2着馬)": cols[26].get_text(strip=True) if len(cols) > 26 else "-"
+            })
+
+    df_results = pd.DataFrame(results_data)
+    clean_horse_name = re.sub(r'[/\\?*:[\]]', '', horse_name)[:30]
+    return df_basic, df_results, clean_horse_name
+
+
+def update_horse_sheet(spreadsheet, sheet_name, df_basic, df_results):
+    try:
+        ws = spreadsheet.worksheet(sheet_name)
+        existing_values = ws.get_all_values()
+    except gspread.exceptions.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=sheet_name, rows=200, cols=30)
+        existing_values = []
+
+    existing_keys = set()
+    for row in existing_values:
+        if len(row) >= 5 and row[0] not in ["日付", "【基本情報】", "【競走成績】", ""]:
+            existing_keys.add(f"{row[0]}_{row[4]}")
+
+    new_races_count = 0
+    if existing_keys:
+        for idx, row in df_results.iterrows():
+            key = f"{row['日付']}_{row['レース名']}"
+            if key not in existing_keys:
+                new_races_count += 1
+
+    all_rows = []
+    all_rows.append(["【基本情報】", ""])
+    for idx, row in df_basic.iterrows():
+        all_rows.append([str(row["項目"]), str(row["内容"])])
+    
+    all_rows.append([])
+    all_rows.append(["【競走成績】"])
+    all_rows.append(df_results.columns.tolist())
+    for idx, row in df_results.iterrows():
+        all_rows.append(row.astype(str).tolist())
+
+    ws.clear()
+    ws.update(values=all_rows)
+
+    if not existing_values:
+        return "新規作成完了"
+    elif new_races_count > 0:
+        return f"更新完了 (+{new_races_count}件)"
+    else:
+        return "最新化完了"
+
+# ================= ================= =================
+#  3. 出走表からの馬URL一括抽出機能
+# ================= ================= =================
+def extract_horse_urls_from_shutuba(shutuba_url):
+    res = requests.get(shutuba_url, headers=HEADERS)
+    res.encoding = res.apparent_encoding
+    soup = BeautifulSoup(res.text, "html.parser")
+
+    horse_links = set()
+    # race.netkeiba / db.netkeiba 両方のリンクパターンに対応
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "/horse/" in href:
+            match = re.search(r'/horse/(\d{10})', href)
+            if match:
+                horse_id = match.group(1)
+                full_url = f"https://db.netkeiba.com/horse/{horse_id}"
+                horse_links.add(full_url)
+
+    return list(horse_links)
+
+
+# ================= ================= =================
+#  Streamlit UI (画面構成)
+# ================= ================= =================
+tab1, tab2, tab3 = st.tabs(["🏁 レース結果取得", "🐎 単体馬データ取得", "🏇 出走表から全馬一括取得"])
+
+# --- TAB 1: レース結果 ---
+with tab1:
+    st.header("レース結果の取得")
+    st.write("netkeibaのレース結果URLから、全着順データを抽出してスプレッドシートへ書き込みます。")
+    race_url = st.text_input("レース結果のURL", value="", key="race_url_input")
+
+    if st.button("レース結果を書き込む", type="primary", key="btn_race"):
+        if not race_url.strip():
+            st.warning("レース結果のURLを入力してください。")
+        else:
+            with st.spinner("レースデータを取得中..."):
+                try:
+                    df_res, sheet_name = fetch_race_results(race_url)
+                    if df_res is not None and not df_res.empty:
+                        client = get_gspread_client()
+                        spreadsheet = client.open_by_key(SPREADSHEET_KEY)
+                        written_title = write_race_to_sheet(spreadsheet, sheet_name, df_res)
+                        st.success(f"✅ シート '{written_title}' へデータを出力しました！")
+                        st.dataframe(df_res)
+                    else:
+                        st.error("データの取得に失敗しました。URLを確認してください。")
+                except Exception as e:
+                    st.error(f"エラーが発生しました: {e}")
+
+# --- TAB 2: 単体馬データ ---
+with tab2:
+    st.header("馬データの取得 (単体)")
+    st.write("同一シート内に基本情報と全競走成績を書き込みます。既に存在する馬の場合は自動で最新データに更新されます。")
+    horse_url = st.text_input("馬ページのURL (例: https://db.netkeiba.com/horse/2021103272)", value="", key="horse_url_input")
+
+    if st.button("馬データを書き込む", type="primary", key="btn_horse"):
+        if not horse_url.strip():
+            st.warning("馬ページのURLを入力してください。")
+        else:
+            with st.spinner("馬データを解析・照合中..."):
+                try:
+                    df_basic, df_results, horse_name = fetch_horse_data(horse_url)
+                    if df_basic is not None and not df_basic.empty:
+                        client = get_gspread_client()
+                        spreadsheet = client.open_by_key(SPREADSHEET_KEY)
+                        
+                        msg = update_horse_sheet(spreadsheet, horse_name, df_basic, df_results)
+                        st.success(f"✅ シート '{horse_name}' : {msg}")
+                        
+                        st.subheader("【基本情報】")
+                        st.dataframe(df_basic)
+                        
+                        st.subheader("【競走成績】")
+                        st.dataframe(df_results)
+                    else:
+                        st.error("馬データの取得に失敗しました。URLを確認してください。")
+                except Exception as e:
+                    st.error(f"エラーが発生しました: {e}")
+
+# --- TAB 3: 出走表から全馬取得 ---
+with tab3:
+    st.header("出走表からの全馬一括取得")
+    st.write("出走表（枠順表）のURLを入力すると、出走する全馬のデータを取得して一括でスプレッドシートへ書き込み・更新します。")
+    shutuba_url = st.text_input("出走表のURL (例: https://race.netkeiba.com/race/shutuba.html?race_id=...)", value="", key="shutuba_url_input")
+
+    if st.button("出走全馬のデータを一括書き込み", type="primary", key="btn_shutuba"):
+        if not shutuba_url.strip():
+            st.warning("出走表のURLを入力してください。")
+        else:
+            with st.spinner("出走馬のURLを抽出中..."):
+                horse_urls = extract_horse_urls_from_shutuba(shutuba_url)
+
+            if not horse_urls:
+                st.error("出走馬のリンクを検出できませんでした。URLを確認してください。")
             else:
-                st.error("データの取得に失敗しました。URLを確認してください。")
-        except Exception as e:
-            st.error(f"エラーが発生しました: {e}")
+                st.info(f"🐎 計 {len(horse_urls)} 頭の出走馬を検出しました。データの取得・書き込みを開始します...")
+                
+                client = get_gspread_client()
+                spreadsheet = client.open_by_key(SPREADSHEET_KEY)
+
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+
+                success_count = 0
+                for idx, h_url in enumerate(horse_urls):
+                    try:
+                        df_basic, df_results, horse_name = fetch_horse_data(h_url)
+                        if df_basic is not None and not df_basic.empty:
+                            msg = update_horse_sheet(spreadsheet, horse_name, df_basic, df_results)
+                            status_text.text(f"[{idx+1}/{len(horse_urls)}] {horse_name} を処理完了 ({msg})")
+                            success_count += 1
+                        else:
+                            status_text.text(f"[{idx+1}/{len(horse_urls)}] 取得失敗: {h_url}")
+                    except Exception as e:
+                        status_text.text(f"[{idx+1}/{len(horse_urls)}] エラー: {e}")
+
+                    # 進捗更新
+                    progress_bar.progress((idx + 1) / len(horse_urls))
+                    time.sleep(1) # IPブロック防止用ウエイト
+
+                st.success(f"🎉 処理が完了しました！ ({success_count}/{len(horse_urls)} 頭書き込み完了)")
