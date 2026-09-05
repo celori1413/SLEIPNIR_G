@@ -147,7 +147,7 @@ def write_race_to_sheet(spreadsheet, sheet_name, df):
     return target_ws.title
 
 # ================= ================= =================
-#  2. 馬データ（基本情報＋競走成績統合） スクレイピング
+#  2. 馬データ スクレイピング（改修版）
 # ================= ================= =================
 def fetch_horse_data(url):
     res = requests.get(url, headers=HEADERS)
@@ -156,7 +156,11 @@ def fetch_horse_data(url):
 
     # --- 馬名取得 ---
     horse_title = soup.find("div", class_="horse_title")
-    horse_name = horse_title.find("h1").get_text(strip=True) if horse_title and horse_title.find("h1") else "競走馬"
+    if horse_title and horse_title.find("h1"):
+        horse_name = horse_title.find("h1").get_text(strip=True)
+    else:
+        h1 = soup.find("h1")
+        horse_name = h1.get_text(strip=True) if h1 else "競走馬"
     horse_name = re.sub(r'[\r\n\t]', '', horse_name)
 
     # --- 基本情報テーブル ---
@@ -171,12 +175,18 @@ def fetch_horse_data(url):
                 val = td.get_text(" ", strip=True)
                 info_dict[key] = val
 
-    # --- 血統テーブル ---
+    # --- 血統情報（修正・強化）---
     blood_table = soup.find("table", class_="blood_table")
     father, mother, mother_father = "-", "-", "-"
     if blood_table:
         a_tags = blood_table.find_all("a")
-        horse_links = [a.get_text(strip=True) for a in a_tags if "/horse/" in a.get("href", "")]
+        horse_links = []
+        for a in a_tags:
+            href = a.get("href", "")
+            txt = a.get_text(strip=True)
+            if "/horse/" in href and txt and txt not in horse_links:
+                horse_links.append(txt)
+        
         if len(horse_links) >= 1:
             father = horse_links[0]
         if len(horse_links) >= 2:
@@ -184,9 +194,9 @@ def fetch_horse_data(url):
         if len(horse_links) >= 3:
             mother_father = horse_links[2]
 
-    # --- 適性レビュー ---
+    # --- コース適性・距離適性（修正・強化）---
     review_dict = {}
-    diag_table = soup.find("table", class_="db_dia_table")
+    diag_table = soup.find("table", class_="db_dia_table") or soup.find("table", class_="dial_table")
     if diag_table:
         for tr in diag_table.find_all("tr"):
             th = tr.find("th")
@@ -194,6 +204,10 @@ def fetch_horse_data(url):
             if th and td:
                 review_dict[th.get_text(strip=True)] = td.get_text(strip=True)
 
+    turf_dirt = review_dict.get("芝", review_dict.get("コース適性", review_dict.get("馬場", "-")))
+    dist_apt = review_dict.get("距離", review_dict.get("距離適性", "-"))
+
+    # 基本データ構築（賞金データは完全削除）
     basic_data = [
         {"項目": "馬名", "内容": horse_name},
         {"項目": "生年月日", "内容": info_dict.get("生年月日", "-")},
@@ -201,61 +215,72 @@ def fetch_horse_data(url):
         {"項目": "馬主", "内容": info_dict.get("馬主", "-")},
         {"項目": "生産者", "内容": info_dict.get("生産者", "-")},
         {"項目": "産地", "内容": info_dict.get("産地", "-")},
-        {"項目": "中央獲得賞金", "内容": info_dict.get("獲得賞金", "-")},
-        {"項目": "地方獲得賞金", "内容": info_dict.get("地方獲得賞金", "-")},
         {"項目": "通算成績", "内容": info_dict.get("通算成績", "-")},
         {"項目": "主な勝鞍", "内容": info_dict.get("主な勝鞍", "-")},
         {"項目": "近親馬", "内容": info_dict.get("近親馬", "-")},
         {"項目": "父", "内容": father},
         {"項目": "母", "内容": mother},
         {"項目": "母父", "内容": mother_father},
-        {"項目": "適性・芝ダート", "内容": review_dict.get("芝", review_dict.get("コース適性", "-"))},
-        {"項目": "距離適性", "内容": review_dict.get("距離", "-")}
+        {"項目": "適性・芝ダート", "内容": turf_dirt},
+        {"項目": "距離適性", "内容": dist_apt}
     ]
     df_basic = pd.DataFrame(basic_data)
 
-    # --- 競走成績テーブル ---
+    # --- 競走成績テーブル（構造変更に対応する堅牢化処理）---
     results_data = []
+    race_table = None
+    
+    # 候補1: 標準的なクラス名
     race_table = (
         soup.find("table", class_="db_h_race_results") or 
         soup.find("table", class_="tbl_had") or 
         soup.find("table", class_="NK_HorseRaceResults") or
         soup.find("table", summary="競走成績")
     )
+    
+    # 候補2: クラス名で見つからない場合は全テーブルから競走成績テーブルを検出
+    if not race_table:
+        all_tables = soup.find_all("table")
+        for tbl in all_tables:
+            txt = tbl.get_text()
+            if "日付" in txt and ("レース名" in txt or "映像" in txt or "頭数" in txt):
+                race_table = tbl
+                break
 
     if race_table:
         rows = race_table.find_all("tr")
         for row in rows:
-            cols = row.find_all("td")
-            if len(cols) < 15:
+            cols = row.find_all(["td", "th"])
+            # ヘッダー行やデータが少ない行をスキップ
+            if len(cols) < 10 or "日付" in cols[0].get_text():
                 continue
             
-            def get_col_val(idx):
+            def get_val(idx):
                 return cols[idx].get_text(strip=True) if len(cols) > idx else "-"
 
             results_data.append({
-                "日付": get_col_val(0),
-                "開催": get_col_val(1),
-                "天気": get_col_val(2),
-                "R": get_col_val(3),
-                "レース名": get_col_val(4),
-                "頭数": get_col_val(6),
-                "枠番": get_col_val(7),
-                "馬番": get_col_val(8),
-                "オッズ": get_col_val(9),
-                "人気": get_col_val(10),
-                "着順": get_col_val(11),
-                "騎手": get_col_val(12),
-                "斤量": get_col_val(13),
-                "距離": get_col_val(14),
-                "馬場": get_col_val(15),
-                "タイム": get_col_val(17),
-                "着差": get_col_val(18),
-                "通過": get_col_val(20),
-                "ペース": get_col_val(21),
-                "上がり": get_col_val(22),
-                "体重": get_col_val(23),
-                "勝ち馬(2着馬)": get_col_val(26)
+                "日付": get_val(0),
+                "開催": get_val(1),
+                "天気": get_val(2),
+                "R": get_val(3),
+                "レース名": get_val(4),
+                "頭数": get_val(6),
+                "枠番": get_val(7),
+                "馬番": get_val(8),
+                "オッズ": get_val(9),
+                "人気": get_val(10),
+                "着順": get_val(11),
+                "騎手": get_val(12),
+                "斤量": get_val(13),
+                "距離": get_val(14),
+                "馬場": get_val(15),
+                "タイム": get_val(17),
+                "着差": get_val(18),
+                "通過": get_val(20),
+                "ペース": get_val(21),
+                "上がり": get_val(22),
+                "体重": get_val(23),
+                "勝ち馬(2着馬)": get_val(26) if len(cols) > 26 else get_val(-1)
             })
 
     df_results = pd.DataFrame(results_data)
