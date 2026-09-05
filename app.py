@@ -6,9 +6,9 @@ from bs4 import BeautifulSoup
 from oauth2client.service_account import ServiceAccountCredentials
 import streamlit as st
 
-st.set_page_config(page_title="netkeiba データ自動同期", layout="centered")
+st.set_page_config(page_title="SLEIPNIR_DB02", layout="centered")
 
-st.title("🏇 netkeiba 競馬結果取得アプリ")
+st.title("SLEIPNIR🏇DB02")
 st.write(
     "netkeibaのURLを入力すると、データを抽出してGoogleスプレッドシートへ書き込みます。"
 )
@@ -20,7 +20,7 @@ race_url = st.text_input(
 )
 
 SPREADSHEET_KEY = "13YkfSZvwRV-sfX6F_rv6mVrEvZku0GZ4jJltbtIgYIE"
-TARGET_GID = "675289019"  # 文字列型で固定
+TARGET_GID = "675289019"
 
 HEADERS = {
     "User-Agent": (
@@ -93,9 +93,14 @@ def append_to_sheet(df):
         "https://www.googleapis.com/auth/drive",
     ]
 
-    # Streamlit Secretsから安全に鍵情報を辞書型で展開
     if "gcp_service_account" in st.secrets:
         key_dict = dict(st.secrets["gcp_service_account"])
+        # --- 修正ポイント: \nの文字列を実際の改行に変換 ---
+        if "private_key" in key_dict:
+            key_dict["private_key"] = key_dict["private_key"].replace(
+                "\\n", "\n"
+            )
+
         creds = ServiceAccountCredentials.from_json_keyfile_dict(
             key_dict, scope
         )
