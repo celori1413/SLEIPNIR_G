@@ -143,7 +143,7 @@ def write_race_to_sheet(spreadsheet, sheet_name, df):
     return target_ws.title
 
 # ================= ================= =================
-#  2. 馬データ スクレイピング
+#  2. 馬データ スクレイピング (成績テーブル判定を二重化)
 # ================= ================= =================
 def fetch_horse_data(url):
     res = requests.get(url, headers=HEADERS)
@@ -219,24 +219,44 @@ def fetch_horse_data(url):
     ]
     df_basic = pd.DataFrame(basic_data)
 
-    # --- 競走成績テーブル ---
+    # --- 競走成績テーブルの抽出 (二段構え) ---
     df_results = pd.DataFrame()
+    
+    # 1st try: pandasで抽出
     try:
         tables = pd.read_html(io.StringIO(html_text))
         for df in tables:
-            cols = [str(c) for c in df.columns]
-            cols_str = "".join(cols)
-            if "日付" in cols_str and "レース名" in cols_str:
+            cols_str = "".join([str(c) for c in df.columns])
+            if any(k in cols_str for k in ["日付", "レース名", "着順", "開催"]):
                 df_results = df
                 break
     except Exception:
         pass
 
+    # 2nd try: pandasで取れなかった場合は直接BeautifulSoupで要素取得
+    if df_results.empty:
+        results_table = soup.find("table", class_="db_h_race_results") or soup.find("table", class_="NK_RaceResult_Table")
+        if results_table:
+            headers_list = [th.get_text(strip=True) for th in results_table.find_all("th")]
+            rows_list = []
+            for tr in results_table.find_all("tr"):
+                tds = tr.find_all("td")
+                if tds:
+                    rows_list.append([td.get_text(strip=True) for td in tds])
+            if headers_list and rows_list:
+                # 列数調整
+                max_cols = max(len(headers_list), max(len(r) for r in rows_list))
+                if len(headers_list) < max_cols:
+                    headers_list += [f"列{i}" for i in range(len(headers_list)+1, max_cols+1)]
+                df_results = pd.DataFrame(rows_list, columns=headers_list[:max_cols])
+
     if not df_results.empty:
         df_results = df_results.fillna("-")
         df_results.columns = [str(c).strip() for c in df_results.columns]
-        if "映像" in df_results.columns:
-            df_results = df_results.drop(columns=["映像"])
+        # 不要な列を除去
+        for c in ["映像", "画像", "掲示板"]:
+            if c in df_results.columns:
+                df_results = df_results.drop(columns=[c])
 
     clean_horse_name = re.sub(r'[/\\?*:[\]]', '', horse_name)[:30]
     return df_basic, df_results, clean_horse_name
@@ -315,7 +335,7 @@ def extract_horse_urls_from_shutuba(shutuba_url):
 
 
 # ================= ================= =================
-#  Streamlit UI (st.formで入力項目を完全保護)
+#  Streamlit UI
 # ================= ================= =================
 tab1, tab2, tab3 = st.tabs(["🏁 レース結果取得", "🐎 単体馬データ取得", "🏇 出走表から全馬一括取得"])
 
@@ -380,7 +400,7 @@ with tab2:
                         if not df_results.empty:
                             st.dataframe(df_results)
                         else:
-                            st.warning("競走成績データが抽出されませんでした。")
+                            st.warning("競走成績データが存在しない（未出走）か、取得されませんでした。")
                     else:
                         st.error("馬データの取得に失敗しました。URLを確認してください。")
                 except Exception as e:
