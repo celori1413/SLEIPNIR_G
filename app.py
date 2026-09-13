@@ -1,3 +1,4 @@
+import os
 import re
 import time
 from datetime import datetime
@@ -9,15 +10,17 @@ from bs4 import BeautifulSoup
 from google.oauth2.service_account import Credentials
 import streamlit as st
 
-st.set_page_config(page_title="SLEIPNIR_DB02", layout="wide")
-
-st.title("SLEIPNIR🏇DB02")
+st.set_page_config(page_title="SLEIPNIR_DB_NEW", layout="wide")
+st.title("SLEIPNIR🏇DB (マルチタブ対応版)")
 
 # ================= ================= =================
-#  スプレッドシート設定
+#  設定と保存フォルダ準備
 # ================= ================= =================
-RACE_SPREADSHEET_KEY = "1_N4GQm5DeWh6lQrRjsA3nDDX5RgSNYwDy83cZiuCJ2c"  # レース結果用 (SLEIPNIR_G_2026RaceDB)
-HORSE_SPREADSHEET_KEY = "1sGPn1S8Uz98YvQjYHaAWpDU-u7kzGoMtig31RFKHK8Q" # 馬データ専用
+RACE_SPREADSHEET_KEY = "1_N4GQm5DeWh6lQrRjsA3nDDX5RgSNYwDy83cZiuCJ2c"  # レース結果用
+HORSE_SPREADSHEET_KEY = "1sGPn1S8Uz98YvQjYHaAWpDU-u7kzGoMtig31RFKHK8Q" # 馬データ用
+
+CACHE_DIR = "./html_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 HEADERS = {
     "User-Agent": (
@@ -48,31 +51,36 @@ def get_gspread_client():
         creds = Credentials.from_service_account_file("secret_key.json", scopes=scopes)
     return gspread.authorize(creds)
 
-def append_execution_log(spreadsheet, tab_name, target_info, status, detail=""):
-    log_sheet_name = "ログ"
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        try:
-            ws = spreadsheet.worksheet(log_sheet_name)
-        except gspread.exceptions.WorksheetNotFound:
-            ws = spreadsheet.add_worksheet(title=log_sheet_name, rows=500, cols=10)
-            ws.append_row(["日時", "実行機能", "対象", "ステータス", "詳細"])
-        ws.append_row([now_str, tab_name, str(target_info), status, str(detail)])
-    except Exception as e:
-        st.warning(f"ログの保存時に警告が発生しました: {e}")
+# ================= ================= =================
+#  HTMLキャッシュ保存・取得機能
+# ================= ================= =================
+def save_and_get_html(url, prefix="page"):
+    url_id = re.sub(r'[^a-zA-Z0-9]', '_', url)
+    filename = f"{prefix}_{url_id}.html"
+    filepath = os.path.join(CACHE_DIR, filename)
 
-# ================= ================= =================
-#  1. レース結果 スクレイピング
-# ================= ================= =================
-def fetch_race_results(url):
+    if os.path.exists(filepath):
+        with open(filepath, "r", encoding="utf-8") as f:
+            return f.read(), filepath
+
     res = requests.get(url, headers=HEADERS)
     res.encoding = res.apparent_encoding
-    soup = BeautifulSoup(res.text, "html.parser")
-    
+    html_content = res.text
+
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+    return html_content, filepath
+
+# ================= ================= =================
+#  1. レース結果のスクレイピング
+# ================= ================= =================
+def parse_race_html(html_text, url):
+    soup = BeautifulSoup(html_text, "html.parser")
     table = soup.find("table", id="All_Result_Table") or soup.find("table", class_="RaceTable01")
     if not table:
         return None, None
-        
+
     year_match = re.search(r'race_id=(\d{4})', url)
     year = year_match.group(1) if year_match else "2026"
 
@@ -81,39 +89,31 @@ def fetch_race_results(url):
         soup.find("h1", class_="RaceName") or 
         soup.find("div", class_="race_name")
     )
-    if race_title_elem:
-        race_name = re.sub(r'[\r\n\t]+', '', race_title_elem.get_text(strip=True))
-    else:
-        race_name = "レース結果"
-
-    full_sheet_name = f"{year}{race_name}"
-    full_sheet_name = re.sub(r'[/\\?*:[\]]', '', full_sheet_name)[:80]
+    race_name = re.sub(r'[\r\n\t]+', '', race_title_elem.get_text(strip=True)) if race_title_elem else "レース結果"
+    full_sheet_name = re.sub(r'[/\\?*:[\]]', '', f"{year}{race_name}")[:80]
 
     data = []
     rows = table.find_all("tr", class_="HorseList")
     
     for row in rows:
         cols = row.find_all("td")
-        if len(cols) < 11:
+        if len(cols) < 13:
             continue
             
-        jockey_col = row.find("td", class_="Jockey") or (cols[6] if len(cols) > 6 else None)
-        jockey = "-"
-        if jockey_col:
-            jockey_a = jockey_col.find("a")
-            jockey = jockey_a.get("title").strip() if (jockey_a and jockey_a.get("title")) else jockey_col.get_text(strip=True)
-        
+        jockey_col = row.find("td", class_="Jockey") or cols[6]
+        jockey_a = jockey_col.find("a") if jockey_col else None
+        jockey_full = jockey_a.get("title").strip() if (jockey_a and jockey_a.get("title")) else jockey_col.get_text(strip=True)
+
         trainer_col = row.find("td", class_="Trainer") or (cols[13] if len(cols) > 13 else None)
-        stable = "-"
+        trainer_full = "-"
         if trainer_col:
             belonging_text = trainer_col.get_text(strip=True)
             belonging = belonging_text[belonging_text.find("["):belonging_text.find("]")+1] if "[" in belonging_text and "]" in belonging_text else ""
             trainer_a = trainer_col.find("a")
             if trainer_a and trainer_a.get("title"):
-                trainer_name = trainer_a.get("title").strip()
-                stable = f"{belonging}{trainer_name}" if belonging else trainer_name
+                trainer_full = f"{belonging}{trainer_a.get('title').strip()}"
             else:
-                stable = belonging_text
+                trainer_full = belonging_text
 
         data.append({
             "着順": cols[0].get_text(strip=True),
@@ -121,77 +121,83 @@ def fetch_race_results(url):
             "馬番": cols[2].get_text(strip=True),
             "馬名": cols[3].get_text(strip=True),
             "性齢": cols[4].get_text(strip=True),
-            "騎手": jockey,
-            "厩舎": stable,
+            "斤量": cols[5].get_text(strip=True),
+            "騎手": jockey_full,
             "タイム": cols[7].get_text(strip=True),
             "着差": cols[8].get_text(strip=True),
-            "コーナー通過順": cols[10].get_text(strip=True)
+            "人気": cols[9].get_text(strip=True) if len(cols) > 9 else "-",
+            "単勝オッズ": cols[10].get_text(strip=True) if len(cols) > 10 else "-",
+            "後3F": cols[11].get_text(strip=True) if len(cols) > 11 else "-",
+            "コーナ通過順": cols[12].get_text(strip=True) if len(cols) > 12 else "-",
+            "厩舎": trainer_full,
+            "馬体重": cols[14].get_text(strip=True) if len(cols) > 14 else "-"
         })
-        
+
     return pd.DataFrame(data), full_sheet_name
 
-def write_race_to_sheet(spreadsheet, sheet_name, df):
-    try:
-        target_ws = spreadsheet.worksheet(sheet_name)
-        target_ws.clear()
-    except gspread.exceptions.WorksheetNotFound:
-        target_ws = spreadsheet.add_worksheet(title=sheet_name, rows=len(df)+10, cols=len(df.columns)+5)
-
-    df = df.fillna("")
-    rows_to_append = [df.columns.tolist()] + df.astype(str).values.tolist()
-    target_ws.update(values=rows_to_append)
-    return target_ws.title
-
 # ================= ================= =================
-#  2. 馬データ スクレイピング (成績テーブル判定を二重化)
+#  2. 馬単体データ（マルチタブ対応）のスクレイピング
 # ================= ================= =================
-def fetch_horse_data(url):
-    res = requests.get(url, headers=HEADERS)
-    res.encoding = res.apparent_encoding
-    html_text = res.text
-    soup = BeautifulSoup(html_text, "html.parser")
-
-    # --- 馬名 ---
-    horse_title = soup.find("div", class_="horse_title")
-    if horse_title and horse_title.find("h1"):
-        horse_name = horse_title.find("h1").get_text(strip=True)
+def fetch_horse_multi_data(base_url):
+    # 馬IDの抽出
+    match = re.search(r'/horse/(\d{10})', base_url)
+    if not match:
+        # 万が一ID形式でない場合でも動作するようフォールバック
+        horse_id = base_url.strip("/").split("/")[-1]
     else:
-        h1 = soup.find("h1")
-        horse_name = h1.get_text(strip=True) if h1 else "競走馬"
+        horse_id = match.group(1)
+
+    ped_url = f"https://db.netkeiba.com/horse/ped/{horse_id}/"
+    result_url = f"https://db.netkeiba.com/horse/result/{horse_id}/"
+
+    # 1. 血統・適性ページ (ped) の取得＆保存
+    html_ped, filepath_ped = save_and_get_html(ped_url, prefix=f"ped_{horse_id}")
+    
+    # 2. 競走成績ページ (result) の取得＆保存
+    html_res, filepath_res = save_and_get_html(result_url, prefix=f"result_{horse_id}")
+
+    # --- 血統・プロフィール解析 ---
+    soup_ped = BeautifulSoup(html_ped, "html.parser")
+
+    # 馬名
+    horse_title = soup_ped.find("div", class_="horse_title")
+    horse_name = horse_title.find("h1").get_text(strip=True) if (horse_title and horse_title.find("h1")) else "競走馬"
     horse_name = re.sub(r'[\r\n\t\s]+', '', horse_name)
 
-    # --- プロフィール情報 ---
+    # 基本情報
     info_dict = {}
-    info_table = soup.find("table", class_="db_prof_table")
+    info_table = soup_ped.find("table", class_="db_prof_table")
     if info_table:
         for tr in info_table.find_all("tr"):
-            th = tr.find("th")
-            td = tr.find("td")
+            th, td = tr.find("th"), tr.find("td")
             if th and td:
-                key = th.get_text(strip=True)
-                val = td.get_text(" ", strip=True)
-                info_dict[key] = val
+                info_dict[th.get_text(strip=True)] = td.get_text(" ", strip=True)
 
-    # --- 血統情報 ---
+    birth_date = info_dict.get("生年月日", "-")
+    age = "-"
+    if birth_date != "-":
+        try:
+            b_year = int(birth_date.split("年")[0])
+            age = f"{datetime.now().year - b_year}歳"
+        except:
+            pass
+
+    # 血統（父・母・母父）
     father, mother, mother_father = "-", "-", "-"
-    blood_table = soup.find("table", class_="blood_table")
+    blood_table = soup_ped.find("table", class_="blood_table")
     if blood_table:
-        td_list = blood_table.find_all("td")
-        extracted_names = []
-        for td in td_list:
-            a_tag = td.find("a")
-            if a_tag:
-                txt = a_tag.get_text(strip=True)
-                if txt and txt not in extracted_names:
-                    extracted_names.append(txt)
-        if len(extracted_names) >= 1: father = extracted_names[0]
-        if len(extracted_names) >= 2: mother = extracted_names[1]
-        if len(extracted_names) >= 3: mother_father = extracted_names[2]
+        extracted = [a.get_text(strip=True) for a in blood_table.find_all("a") if a.get_text(strip=True)]
+        extracted_unique = []
+        for name in extracted:
+            if name not in extracted_unique:
+                extracted_unique.append(name)
+        if len(extracted_unique) >= 1: father = extracted_unique[0]
+        if len(extracted_unique) >= 2: mother = extracted_unique[1]
+        if len(extracted_unique) >= 3: mother_father = extracted_unique[2]
 
-    # --- コース適性・距離適性 ---
-    turf_dirt = "-"
-    dist_apt = "-"
-    diag_table = soup.find("table", class_="db_dia_table") or soup.find("table", class_="dial_table")
+    # コース適性・適正距離
+    turf_dirt, dist_apt = "-", "-"
+    diag_table = soup_ped.find("table", class_="db_dia_table") or soup_ped.find("table", class_="dial_table")
     if diag_table:
         text_content = diag_table.get_text()
         if "芝" in text_content and "ダート" in text_content: turf_dirt = "芝・ダート兼配"
@@ -203,7 +209,8 @@ def fetch_horse_data(url):
 
     basic_data = [
         {"項目": "馬名", "内容": horse_name},
-        {"項目": "生年月日", "内容": info_dict.get("生年月日", "-")},
+        {"項目": "生年月日", "内容": birth_date},
+        {"項目": "年齢", "内容": age},
         {"項目": "調教師", "内容": info_dict.get("調教師", "-")},
         {"項目": "馬主", "内容": info_dict.get("馬主", "-")},
         {"項目": "生産者", "内容": info_dict.get("生産者", "-")},
@@ -214,238 +221,126 @@ def fetch_horse_data(url):
         {"項目": "父", "内容": father},
         {"項目": "母", "内容": mother},
         {"項目": "母父", "内容": mother_father},
-        {"項目": "適性・芝ダート", "内容": turf_dirt},
-        {"項目": "距離適性", "内容": dist_apt}
+        {"項目": "コース適性", "内容": turf_dirt},
+        {"項目": "適正距離", "内容": dist_apt}
     ]
     df_basic = pd.DataFrame(basic_data)
 
-    # --- 競走成績テーブルの抽出 (二段構え) ---
+    # --- 競走成績解析 (result ページから抽出) ---
+    soup_res = BeautifulSoup(html_res, "html.parser")
     df_results = pd.DataFrame()
     
-    # 1st try: pandasで抽出
     try:
-        tables = pd.read_html(io.StringIO(html_text))
+        tables = pd.read_html(io.StringIO(html_res))
         for df in tables:
             cols_str = "".join([str(c) for c in df.columns])
             if any(k in cols_str for k in ["日付", "レース名", "着順", "開催"]):
                 df_results = df
                 break
-    except Exception:
+    except:
         pass
 
-    # 2nd try: pandasで取れなかった場合は直接BeautifulSoupで要素取得
     if df_results.empty:
-        results_table = soup.find("table", class_="db_h_race_results") or soup.find("table", class_="NK_RaceResult_Table")
+        results_table = soup_res.find("table", class_="db_h_race_results") or soup_res.find("table", class_="NK_RaceResult_Table")
         if results_table:
-            headers_list = [th.get_text(strip=True) for th in results_table.find_all("th")]
-            rows_list = []
+            headers = [th.get_text(strip=True) for th in results_table.find_all("th")]
+            rows = []
             for tr in results_table.find_all("tr"):
                 tds = tr.find_all("td")
                 if tds:
-                    rows_list.append([td.get_text(strip=True) for td in tds])
-            if headers_list and rows_list:
-                # 列数調整
-                max_cols = max(len(headers_list), max(len(r) for r in rows_list))
-                if len(headers_list) < max_cols:
-                    headers_list += [f"列{i}" for i in range(len(headers_list)+1, max_cols+1)]
-                df_results = pd.DataFrame(rows_list, columns=headers_list[:max_cols])
+                    rows.append([td.get_text(strip=True) for td in tds])
+            if headers and rows:
+                df_results = pd.DataFrame(rows, columns=headers[:len(rows[0])])
 
     if not df_results.empty:
         df_results = df_results.fillna("-")
         df_results.columns = [str(c).strip() for c in df_results.columns]
-        # 不要な列を除去
-        for c in ["映像", "画像", "掲示板"]:
-            if c in df_results.columns:
-                df_results = df_results.drop(columns=[c])
+        for drop_col in ["映像", "画像", "掲示板"]:
+            if drop_col in df_results.columns:
+                df_results = df_results.drop(columns=[drop_col])
 
     clean_horse_name = re.sub(r'[/\\?*:[\]]', '', horse_name)[:30]
-    return df_basic, df_results, clean_horse_name
+    return df_basic, df_results, clean_horse_name, filepath_ped, filepath_res
 
-
-def update_horse_sheet(spreadsheet, sheet_name, df_basic, df_results):
+# ================= ================= =================
+#  スプレッドシート書き込み機能
+# ================= ================= =================
+def write_to_spreadsheet(spreadsheet, sheet_name, df_data):
     try:
         ws = spreadsheet.worksheet(sheet_name)
-        existing_values = ws.get_all_values()
+        ws.clear()
+    except gspread.exceptions.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=sheet_name, rows=len(df_data)+50, cols=30)
+
+    rows = [df_data.columns.tolist()] + df_data.astype(str).values.tolist()
+    ws.update(values=rows)
+
+def update_horse_to_spreadsheet(spreadsheet, sheet_name, df_basic, df_results):
+    try:
+        ws = spreadsheet.worksheet(sheet_name)
+        ws.clear()
     except gspread.exceptions.WorksheetNotFound:
         ws = spreadsheet.add_worksheet(title=sheet_name, rows=300, cols=30)
-        existing_values = []
 
-    existing_keys = set()
-    for row in existing_values:
-        if len(row) >= 5 and row[0] not in ["日付", "【基本情報】", "【競走成績】", ""]:
-            existing_keys.add(f"{row[0]}_{row[4]}")
-
-    new_races_count = 0
-    if existing_keys and not df_results.empty:
-        for idx, row in df_results.iterrows():
-            date_val = str(row.get("日付", ""))
-            race_val = str(row.get("レース名", ""))
-            key = f"{date_val}_{race_val}"
-            if key not in existing_keys:
-                new_races_count += 1
-
-    all_rows = []
-    all_rows.append(["【基本情報】", ""])
+    all_rows = [["【基本情報】", ""]]
     for idx, row in df_basic.iterrows():
         all_rows.append([str(row["項目"]), str(row["内容"])])
-    
+
     all_rows.append([])
     all_rows.append(["【競走成績】"])
-    
+
     if not df_results.empty:
         all_rows.append(df_results.columns.tolist())
         for idx, row in df_results.iterrows():
             all_rows.append(row.astype(str).tolist())
     else:
-        all_rows.append(["（※競走成績データなし・未出走馬）"])
+        all_rows.append(["（競走成績データなし）"])
 
-    ws.clear()
     ws.update(values=all_rows)
-
-    if not existing_values:
-        return "新規作成完了"
-    elif new_races_count > 0:
-        return f"更新完了 (+{new_races_count}件追加)"
-    else:
-        return "最新化完了 (追加データなし)"
-
-# ================= ================= =================
-#  3. 出走表からの馬URL一括抽出機能
-# ================= ================= =================
-def extract_horse_urls_from_shutuba(shutuba_url):
-    res = requests.get(shutuba_url, headers=HEADERS)
-    res.encoding = res.apparent_encoding
-    soup = BeautifulSoup(res.text, "html.parser")
-
-    horse_links = []
-    seen = set()
-    
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "/horse/" in href:
-            match = re.search(r'/horse/(\d{10})', href)
-            if match:
-                horse_id = match.group(1)
-                full_url = f"https://db.netkeiba.com/horse/{horse_id}"
-                if full_url not in seen:
-                    seen.add(full_url)
-                    horse_links.append(full_url)
-
-    return horse_links
-
 
 # ================= ================= =================
 #  Streamlit UI
 # ================= ================= =================
-tab1, tab2, tab3 = st.tabs(["🏁 レース結果取得", "🐎 単体馬データ取得", "🏇 出走表から全馬一括取得"])
+tab1, tab2 = st.tabs(["🏁 レース結果取得", "🐎 馬データ取得 (単体)"])
 
-# --- TAB 1: レース結果 ---
 with tab1:
     st.header("レース結果の取得")
-    st.caption("保存先: SLEIPNIR_G_2026RaceDB")
-    
-    with st.form(key="form_race"):
-        race_url = st.text_input("レース結果のURL", value="", key="race_url_input")
-        submit_race = st.form_submit_button("レース結果を書き込む", type="primary")
+    with st.form("race_form"):
+        race_url = st.text_input("レース結果URL")
+        submit_race = st.form_submit_button("HTML保存 & データ解析実行", type="primary")
 
-    if submit_race:
-        if not race_url.strip():
-            st.warning("レース結果のURLを入力してください。")
-        else:
-            with st.spinner("レースデータを取得中..."):
-                try:
-                    df_res, sheet_name = fetch_race_results(race_url)
-                    if df_res is not None and not df_res.empty:
-                        client = get_gspread_client()
-                        spreadsheet = client.open_by_key(RACE_SPREADSHEET_KEY)
-                        written_title = write_race_to_sheet(spreadsheet, sheet_name, df_res)
-                        
-                        append_execution_log(spreadsheet, "レース結果取得", race_url, "SUCCESS", f"シート '{written_title}' ({len(df_res)}件)")
-                        st.success(f"✅ シート '{written_title}' へデータを出力しました！")
-                        st.dataframe(df_res)
-                    else:
-                        st.error("データの取得に失敗しました。URLを確認してください。")
-                except Exception as e:
-                    st.error(f"エラーが発生しました: {e}")
+    if submit_race and race_url:
+        with st.spinner("HTMLを保存して解析中..."):
+            html_content, filepath = save_and_get_html(race_url, prefix="race")
+            st.info(f"📁 レース結果HTMLを保存しました: `{filepath}`")
 
-# --- TAB 2: 単体馬データ ---
+            df_race, sheet_name = parse_race_html(html_content, race_url)
+            if df_race is not None and not df_race.empty:
+                client = get_gspread_client()
+                sp = client.open_by_key(RACE_SPREADSHEET_KEY)
+                write_to_spreadsheet(sp, sheet_name, df_race)
+                st.success(f"✅ スプレッドシート '{sheet_name}' へ記入が完了しました！")
+                st.dataframe(df_race)
+
 with tab2:
     st.header("馬データの取得 (単体)")
-    st.caption("保存先: 馬データ専用スプレッドシート")
-    
-    with st.form(key="form_horse"):
-        horse_url = st.text_input("馬ページのURL (例: https://db.netkeiba.com/horse/2021103272)", value="", key="horse_url_input")
-        submit_horse = st.form_submit_button("馬データを書き込む", type="primary")
+    with st.form("horse_form"):
+        horse_url = st.text_input("馬ページURL (例: https://db.netkeiba.com/horse/2017101429)")
+        submit_horse = st.form_submit_button("HTML保存 & データ解析実行", type="primary")
 
-    if submit_horse:
-        if not horse_url.strip():
-            st.warning("馬ページのURLを入力してください。")
-        else:
-            with st.spinner("馬データを解析・照合中..."):
-                try:
-                    df_basic, df_results, horse_name = fetch_horse_data(horse_url)
-                    if df_basic is not None and not df_basic.empty:
-                        client = get_gspread_client()
-                        spreadsheet = client.open_by_key(HORSE_SPREADSHEET_KEY)
-                        
-                        msg = update_horse_sheet(spreadsheet, horse_name, df_basic, df_results)
-                        append_execution_log(spreadsheet, "単体馬データ取得", horse_name, "SUCCESS", f"{msg} (成績:{len(df_results)}件)")
-                        
-                        st.success(f"✅ シート '{horse_name}' : {msg}")
-                        
-                        st.subheader("【基本情報】")
-                        st.dataframe(df_basic)
-                        
-                        st.subheader("【競走成績】")
-                        if not df_results.empty:
-                            st.dataframe(df_results)
-                        else:
-                            st.warning("競走成績データが存在しない（未出走）か、取得されませんでした。")
-                    else:
-                        st.error("馬データの取得に失敗しました。URLを確認してください。")
-                except Exception as e:
-                    st.error(f"エラーが発生しました: {e}")
+    if submit_horse and horse_url:
+        with st.spinner("血統ページと成績ページのHTMLを保存・解析中..."):
+            df_basic, df_results, horse_name, fp_ped, fp_res = fetch_horse_multi_data(horse_url)
+            
+            st.info(f"📁 血統HTMLを保存しました: `{fp_ped}`")
+            st.info(f"📁 成績HTMLを保存しました: `{fp_res}`")
 
-# --- TAB 3: 出走表から全馬取得 ---
-with tab3:
-    st.header("出走表からの全馬一括取得")
-    st.caption("保存先: 馬データ専用スプレッドシート")
-    
-    with st.form(key="form_shutuba"):
-        shutuba_url = st.text_input("出走表のURL", value="", key="shutuba_url_input")
-        submit_shutuba = st.form_submit_button("出走全馬のデータを一括書き込み", type="primary")
+            client = get_gspread_client()
+            sp = client.open_by_key(HORSE_SPREADSHEET_KEY)
+            update_horse_to_spreadsheet(sp, horse_name, df_basic, df_results)
 
-    if submit_shutuba:
-        if not shutuba_url.strip():
-            st.warning("出走表のURLを入力してください。")
-        else:
-            with st.spinner("出走馬のURLを抽出中..."):
-                horse_urls = extract_horse_urls_from_shutuba(shutuba_url)
-
-            if not horse_urls:
-                st.error("出走馬のリンクを検出できませんでした。URLを確認してください。")
-            else:
-                st.info(f"🐎 計 {len(horse_urls)} 頭の出走馬を検出しました。開始します...")
-                client = get_gspread_client()
-                spreadsheet = client.open_by_key(HORSE_SPREADSHEET_KEY)
-
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                success_count = 0
-
-                for idx, h_url in enumerate(horse_urls):
-                    try:
-                        df_basic, df_results, horse_name = fetch_horse_data(h_url)
-                        if df_basic is not None and not df_basic.empty:
-                            msg = update_horse_sheet(spreadsheet, horse_name, df_basic, df_results)
-                            res_msg = f"[{idx+1}/{len(horse_urls)}] {horse_name} : {msg}"
-                            status_text.text(res_msg)
-                            append_execution_log(spreadsheet, "出走表全馬取得", horse_name, "SUCCESS", msg)
-                            success_count += 1
-                    except Exception as e:
-                        status_text.text(f"[{idx+1}/{len(horse_urls)}] エラー: {e}")
-
-                    progress_bar.progress((idx + 1) / len(horse_urls))
-                    time.sleep(1)
-
-                st.success(f"🎉 処理完了 ({success_count}/{len(horse_urls)} 頭成功)")
+            st.success(f"✅ シート '{horse_name}' へ基本情報および競走成績の記入が完了しました！")
+            st.subheader("【基本情報】")
+            st.dataframe(df_basic)
+            st.subheader("【競走成績】")
+            st.dataframe(df_results)
